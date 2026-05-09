@@ -1,6 +1,7 @@
 import sys
 import os
 import csv
+import threading
 
 def _base_dir():
     """Pasta para gravar sessões: ao lado do exe (frozen) ou do script (dev)."""
@@ -22,6 +23,7 @@ import mediapipe as mp
 import math
 from openni import openni2
 from collections import deque
+from types import SimpleNamespace
 import pyqtgraph as pg
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
                              QVBoxLayout, QHBoxLayout, QCheckBox, QGroupBox,
@@ -201,6 +203,11 @@ def criar_separador():
 # ── Funções biomecânicas ────────────────────────────────────────────────────────
 THRESHOLD_VISIBILIDADE = 0.5
 JANELA_SUAVIZACAO = 5
+# Quadril: threshold menor pois roupas reduzem visibilidade, mais frames de histórico
+THRESHOLD_VISIBILIDADE_QUADRIL = 0.35
+JANELA_POSICAO_QUADRIL = 8
+LIMIAR_SALTO_QUADRIL = 0.07   # salto máximo em coordenadas normalizadas por frame
+MAX_FRAMES_INTERPOLACAO_QUADRIL = 15
 
 def extrair_coordenada_3d(landmark, w, h, depth_img):
     px, py = int(landmark.x * w), int(landmark.y * h)
@@ -226,6 +233,55 @@ def calcular_angulo_2d(lm_a, lm_b, lm_c, w, h):
     normas = np.linalg.norm(ba) * np.linalg.norm(bc)
     if normas == 0: return 0.0
     return math.degrees(math.acos(np.clip(np.dot(ba, bc) / normas, -1.0, 1.0)))
+
+
+# Chaves dos novos métricas 3D do ombro
+_CHAVES_OMBRO_3D = (
+    'ombro_abd_esquerdo', 'ombro_abd_direito',
+    'ombro_flex_esquerdo', 'ombro_flex_direito',
+    'ombro_rot_esquerdo', 'ombro_rot_direito',
+)
+
+def _angulo_frontal_ombro(sh, hip, el):
+    """Abducao/aducao: angulo tronco-braco no plano frontal (X-Y, ignora Z)."""
+    tx, ty = hip.x - sh.x, hip.y - sh.y
+    bx, by = el.x - sh.x, el.y - sh.y
+    nt = math.sqrt(tx*tx + ty*ty)
+    nb = math.sqrt(bx*bx + by*by)
+    if nt == 0 or nb == 0: return 0.0
+    return math.degrees(math.acos(max(-1.0, min(1.0, (tx*bx + ty*by) / (nt * nb)))))
+
+def _angulo_sagital_ombro(sh, hip, el):
+    """Flexao/extensao: angulo tronco-braco no plano sagital (Y-Z, ignora X)."""
+    ty, tz = hip.y - sh.y, hip.z - sh.z
+    by_, bz = el.y - sh.y, el.z - sh.z
+    nt = math.sqrt(ty*ty + tz*tz)
+    nb = math.sqrt(by_*by_ + bz*bz)
+    if nt == 0 or nb == 0: return 0.0
+    return math.degrees(math.acos(max(-1.0, min(1.0, (ty*by_ + tz*bz) / (nt * nb)))))
+
+def _angulo_rotacao_ombro(sh, el, wr):
+    """Rotacao: angulo do antebraco projetado no plano perpendicular ao braco superior."""
+    u = np.array([el.x - sh.x, el.y - sh.y, el.z - sh.z], dtype=float)
+    nu = np.linalg.norm(u)
+    if nu < 1e-6: return 0.0
+    u /= nu
+    f = np.array([wr.x - el.x, wr.y - el.y, wr.z - el.z], dtype=float)
+    nf = np.linalg.norm(f)
+    if nf < 1e-6: return 0.0
+    f /= nf
+    # Referencia: vertical do mundo (Y negativo = cima nos world landmarks)
+    vert = np.array([0.0, -1.0, 0.0])
+    ref = vert - np.dot(vert, u) * u
+    nr = np.linalg.norm(ref)
+    if nr < 1e-6: return 0.0
+    ref /= nr
+    # Antebraco projetado no mesmo plano
+    f_perp = f - np.dot(f, u) * u
+    nfp = np.linalg.norm(f_perp)
+    if nfp < 1e-6: return 0.0
+    f_perp /= nfp
+    return math.degrees(math.acos(max(-1.0, min(1.0, np.dot(ref, f_perp)))))
 
 
 # ── Motor de bastidores ─────────────────────────────────────────────────────────
@@ -275,6 +331,23 @@ class MotorBiomecanico(QThread):
             'tornozelo_direito':  (PL.RIGHT_KNEE,      PL.RIGHT_ANKLE,    PL.RIGHT_FOOT_INDEX),
         }
         self.suavizador = {k: deque(maxlen=JANELA_SUAVIZACAO) for k in self.MAPA_ARTICULACOES}
+        for _k in _CHAVES_OMBRO_3D:
+            self.suavizador[_k] = deque(maxlen=JANELA_SUAVIZACAO)
+
+        # Suavizador de posição para landmarks do quadril e joelho
+        _PL = self.mp_holistic.PoseLandmark
+        self._idx_quadril = {
+            _PL.LEFT_HIP.value, _PL.RIGHT_HIP.value,
+            _PL.LEFT_KNEE.value, _PL.RIGHT_KNEE.value,
+        }
+        self._hist_pos       = {i: deque(maxlen=JANELA_POSICAO_QUADRIL) for i in self._idx_quadril}
+        self._ultima_pos     = {i: None for i in self._idx_quadril}
+        self._frames_perdido = {i: 0    for i in self._idx_quadril}
+
+        # FPS real medido no loop de captura — usado ao criar o VideoWriter
+        self._fps_real        = 25.0
+        self._fps_conta_loop  = 0
+        self._fps_t_loop      = time.time()
 
         self.kinect_ativo = False
         self.webcam_ativa = False
@@ -327,23 +400,114 @@ class MotorBiomecanico(QThread):
             'Ombro_Esq','Ombro_Dir','Cotovelo_Esq','Cotovelo_Dir',
             'Punho_Esq','Punho_Dir','Quadril_Esq','Quadril_Dir',
             'Joelho_Esq','Joelho_Dir','Tornozelo_Esq','Tornozelo_Dir',
-            'Inclinacao_Cabeca'
+            'Inclinacao_Cabeca',
+            'Ombro_Abd_Esq','Ombro_Abd_Dir',
+            'Ombro_Flex_Esq','Ombro_Flex_Dir',
+            'Ombro_Rot_Esq','Ombro_Rot_Dir',
         ])
         larg, alt = self._resolucao_captura()
+        # Usa o FPS medido no loop de captura para evitar vídeo acelerado.
+        # Clampeia entre 5 e 60 para evitar valores absurdos antes da medição estabilizar.
+        fps_gravacao = float(max(5, min(60, round(self._fps_real))))
         self.video_writer = cv2.VideoWriter(
             os.path.join(pasta, base + ".avi"),
-            cv2.VideoWriter_fourcc(*'XVID'), 25.0, (larg, alt))
+            cv2.VideoWriter_fourcc(*'XVID'), fps_gravacao, (larg, alt))
         self.tempo_inicio_gravacao = time.time()
         self.gravando = True
 
     def parar_gravacao(self):
         self.gravando = False
-        if self.arquivo_csv: self.arquivo_csv.close(); self.arquivo_csv = None
-        if self.video_writer: self.video_writer.release(); self.video_writer = None
+        if self.arquivo_csv:
+            self.arquivo_csv.close()
+            self.arquivo_csv = None
+        # Salva referência local e zera o atributo ANTES de soltar o writer.
+        # release() pode bloquear vários segundos (flush do codec XVID);
+        # rodá-lo em background evita congelar o feed da câmera.
+        _vw = self.video_writer
+        self.video_writer = None
+        if _vw:
+            threading.Thread(target=_vw.release, daemon=True).start()
 
     def _inclinacao_cabeca(self, fl, w, h):
         e, d = fl.landmark[33], fl.landmark[263]
         return round(math.degrees(math.atan2((d.y - e.y) * h, (d.x - e.x) * w)), 1)
+
+    def _posicao_quadril(self, idx, lm):
+        """Retorna (x_norm, y_norm) suavizados para landmarks do quadril/joelho.
+        Aplica rejeição de outlier e interpolação quando o tracking é perdido."""
+        hist = self._hist_pos[idx]
+        if lm.visibility >= THRESHOLD_VISIBILIDADE_QUADRIL:
+            x_raw, y_raw = lm.x, lm.y
+            # Rejeita saltos bruscos usando a média histórica
+            if len(hist) >= 3:
+                x_med = sum(p[0] for p in hist) / len(hist)
+                y_med = sum(p[1] for p in hist) / len(hist)
+                if math.sqrt((x_raw - x_med) ** 2 + (y_raw - y_med) ** 2) > LIMIAR_SALTO_QUADRIL:
+                    x_raw, y_raw = x_med, y_med
+            hist.append((x_raw, y_raw))
+            x_s = sum(p[0] for p in hist) / len(hist)
+            y_s = sum(p[1] for p in hist) / len(hist)
+            self._ultima_pos[idx]     = (x_s, y_s)
+            self._frames_perdido[idx] = 0
+            return (x_s, y_s)
+        else:
+            self._frames_perdido[idx] += 1
+            if self._frames_perdido[idx] <= MAX_FRAMES_INTERPOLACAO_QUADRIL and self._ultima_pos[idx]:
+                return self._ultima_pos[idx]
+            return None
+
+    def _lm_efetivo(self, idx, lm):
+        """Retorna landmark efetivo: suavizado para quadril/joelho, raw para os demais."""
+        if idx in self._idx_quadril:
+            pos = self._posicao_quadril(idx, lm)
+            if pos is None:
+                return None
+            return SimpleNamespace(x=pos[0], y=pos[1], visibility=1.0)
+        return lm if lm.visibility >= THRESHOLD_VISIBILIDADE else None
+
+    def _calcular_ombros_3d(self, wlms, slms, w, h, img_bgr, img_ir_color, ang):
+        """Calcula abducao, flexao e rotacao do ombro usando pose_world_landmarks 3D."""
+        PL = self.mp_holistic.PoseLandmark
+        THRESH = 0.5
+        lados = [
+            ('esquerdo', PL.LEFT_SHOULDER,  PL.LEFT_HIP,  PL.LEFT_ELBOW,  PL.LEFT_WRIST),
+            ('direito',  PL.RIGHT_SHOULDER, PL.RIGHT_HIP, PL.RIGHT_ELBOW, PL.RIGHT_WRIST),
+        ]
+        for lado, pl_sh, pl_hip, pl_el, pl_wr in lados:
+            iSH, iHIP, iEL, iWR = pl_sh.value, pl_hip.value, pl_el.value, pl_wr.value
+            if min(slms[iSH].visibility, slms[iHIP].visibility,
+                   slms[iEL].visibility, slms[iWR].visibility) < THRESH:
+                continue
+            sh, hip, el, wr = wlms[iSH], wlms[iHIP], wlms[iEL], wlms[iWR]
+            for chave, val in [
+                (f'ombro_abd_{lado}',  _angulo_frontal_ombro(sh, hip, el)),
+                (f'ombro_flex_{lado}', _angulo_sagital_ombro(sh, hip, el)),
+                (f'ombro_rot_{lado}',  _angulo_rotacao_ombro(sh, el, wr)),
+            ]:
+                if val > 0:
+                    self.suavizador[chave].append(val)
+                    ang[chave] = round(sum(self.suavizador[chave]) / len(self.suavizador[chave]), 1)
+            # Anotações na imagem (somente se o checkbox estiver ativo)
+            cx = int(slms[iSH].x * w)
+            cy = int(slms[iSH].y * h)
+            off_x = 15 if lado == 'direito' else -82
+            linha = 0
+            for chave, lbl, cor in [
+                (f'ombro_abd_{lado}',  'Abd',  (255, 140,   0)),
+                (f'ombro_flex_{lado}', 'Flex', (  0, 200, 255)),
+                (f'ombro_rot_{lado}',  'Rot',  (200,   0, 255)),
+            ]:
+                if chave in self.articulacoes_ativas:
+                    v = ang.get(chave, 0)
+                    if v > 0:
+                        cv2.putText(img_bgr, f"{lbl}:{int(v)}",
+                                    (cx + off_x, cy + 22 + linha * 22),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, cor, 2)
+                        if img_ir_color is not None:
+                            cv2.putText(img_ir_color, f"{lbl}:{int(v)}",
+                                        (cx + off_x, cy + 22 + linha * 22),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
+                        linha += 1
 
     def processar_e_desenhar(self, img_bgr, img_ir_color, img_depth):
         h, w = img_bgr.shape[:2]
@@ -398,20 +562,23 @@ class MotorBiomecanico(QThread):
                 if nome not in self.MAPA_ARTICULACOES: continue
                 eA, eB, eC = self.MAPA_ARTICULACOES[nome]
                 iA, iB, iC = eA.value, eB.value, eC.value
-                if min(lms[iA].visibility, lms[iB].visibility, lms[iC].visibility) < THRESHOLD_VISIBILIDADE:
+                lm_a = self._lm_efetivo(iA, lms[iA])
+                lm_b = self._lm_efetivo(iB, lms[iB])
+                lm_c = self._lm_efetivo(iC, lms[iC])
+                if lm_a is None or lm_b is None or lm_c is None:
                     continue
                 if img_depth is not None:
                     angulo = calcular_angulo_3d(
-                        extrair_coordenada_3d(lms[iA], w, h, img_depth),
-                        extrair_coordenada_3d(lms[iB], w, h, img_depth),
-                        extrair_coordenada_3d(lms[iC], w, h, img_depth))
+                        extrair_coordenada_3d(lm_a, w, h, img_depth),
+                        extrair_coordenada_3d(lm_b, w, h, img_depth),
+                        extrair_coordenada_3d(lm_c, w, h, img_depth))
                 else:
-                    angulo = calcular_angulo_2d(lms[iA], lms[iB], lms[iC], w, h)
+                    angulo = calcular_angulo_2d(lm_a, lm_b, lm_c, w, h)
 
                 if angulo > 0:
                     self.suavizador[nome].append(angulo)
                     suave = sum(self.suavizador[nome]) / len(self.suavizador[nome])
-                    cx_pt = int(lms[iB].x * w); cy_pt = int(lms[iB].y * h)
+                    cx_pt = int(lm_b.x * w); cy_pt = int(lm_b.y * h)
                     cor = (0,255,0) if suave > 90 else (0,200,255) if suave > 45 else (0,0,255)
                     cv2.putText(img_bgr, f"{int(suave)}", (cx_pt+15, cy_pt),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, cor, 2)
@@ -419,6 +586,21 @@ class MotorBiomecanico(QThread):
                         cv2.putText(img_ir_color, f"{int(suave)}", (cx_pt+15, cy_pt),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
                     ang[nome] = round(suave, 1)
+
+            # Círculo laranja sobre landmarks do quadril quando em modo interpolação
+            _PL_v = self.mp_holistic.PoseLandmark
+            for _idx in (_PL_v.LEFT_HIP.value, _PL_v.RIGHT_HIP.value):
+                if self._frames_perdido.get(_idx, 0) > 0 and self._ultima_pos[_idx]:
+                    _xp = int(self._ultima_pos[_idx][0] * w)
+                    _yp = int(self._ultima_pos[_idx][1] * h)
+                    cv2.circle(img_bgr, (_xp, _yp), 10, (0, 140, 255), 2)
+
+            # Análise 3D do ombro (abducao, flexao, rotacao)
+            if results.pose_world_landmarks:
+                self._calcular_ombros_3d(
+                    results.pose_world_landmarks.landmark,
+                    results.pose_landmarks.landmark,
+                    w, h, img_bgr, img_ir_color, ang)
 
         return img_bgr, img_ir_color, ang
 
@@ -472,13 +654,25 @@ class MotorBiomecanico(QThread):
                 for key in ['ombro_esquerdo','ombro_direito','cotovelo_esquerdo','cotovelo_direito',
                             'punho_esquerdo','punho_direito','quadril_esquerdo','quadril_direito',
                             'joelho_esquerdo','joelho_direito','tornozelo_esquerdo','tornozelo_direito',
-                            'inclinacao_cabeca']:
+                            'inclinacao_cabeca',
+                            'ombro_abd_esquerdo','ombro_abd_direito',
+                            'ombro_flex_esquerdo','ombro_flex_direito',
+                            'ombro_rot_esquerdo','ombro_rot_direito']:
                     v = ang.get(key, 0.0)
                     linha.append(v if v != 0.0 else '')
                 self.escritor_csv.writerow(linha)
                 if self.video_writer: self.video_writer.write(frame_rgb)
 
             if frame_rgb is not None:
+                # Mede FPS real do loop para usar na criação do VideoWriter
+                self._fps_conta_loop += 1
+                _agora = time.time()
+                _delta = _agora - self._fps_t_loop
+                if _delta >= 2.0:
+                    self._fps_real    = self._fps_conta_loop / _delta
+                    self._fps_conta_loop = 0
+                    self._fps_t_loop  = _agora
+
                 self.sinal_frames_prontos.emit(frame_rgb, frame_3d, frame_ir, texto_crono, ang)
 
     def stop(self):
@@ -703,6 +897,14 @@ class JanelaBioMotion(QMainWindow):
                 ("Punho Esq",     "punho_esquerdo"),
                 ("Punho Dir",     "punho_direito"),
             ]),
+            ("Ombro 3D  ·  Abertura · Flexão · Rotação", C_PURPLE, [
+                ("Abd Esq",  "ombro_abd_esquerdo"),
+                ("Abd Dir",  "ombro_abd_direito"),
+                ("Flex Esq", "ombro_flex_esquerdo"),
+                ("Flex Dir", "ombro_flex_direito"),
+                ("Rot Esq",  "ombro_rot_esquerdo"),
+                ("Rot Dir",  "ombro_rot_direito"),
+            ]),
             ("Membro Inferior", C_GREEN, [
                 ("Quadril Esq",   "quadril_esquerdo"),
                 ("Quadril Dir",   "quadril_direito"),
@@ -867,24 +1069,30 @@ class JanelaBioMotion(QMainWindow):
         # Buffers do gráfico
         self.buffer_size = 150
         self.eixo_x_tempo = deque(maxlen=self.buffer_size)
-        _keys = list(self.motor.MAPA_ARTICULACOES.keys())
-        self.eixo_y_dados = {k: deque(maxlen=self.buffer_size) for k in _keys}
         self.frame_count = 0
 
         _CORES_PLOT = {
-            'ombro_esquerdo':     ('#FF6B35', Qt.SolidLine,   'Ombro Esq'),
-            'ombro_direito':      ('#4ECDC4', Qt.SolidLine,   'Ombro Dir'),
-            'cotovelo_esquerdo':  ('#f85149', Qt.SolidLine,   'Cotovelo Esq'),
-            'cotovelo_direito':   ('#3fb950', Qt.SolidLine,   'Cotovelo Dir'),
-            'punho_esquerdo':     ('#d29922', Qt.DashLine,    'Punho Esq'),
-            'punho_direito':      ('#e6edf3', Qt.DashLine,    'Punho Dir'),
-            'quadril_esquerdo':   ('#bc8cff', Qt.DotLine,     'Quadril Esq'),
-            'quadril_direito':    ('#A8E6CF', Qt.DotLine,     'Quadril Dir'),
-            'joelho_esquerdo':    ('#58a6ff', Qt.SolidLine,   'Joelho Esq'),
-            'joelho_direito':     ('#00d4aa', Qt.SolidLine,   'Joelho Dir'),
-            'tornozelo_esquerdo': ('#FF8B94', Qt.DashDotLine, 'Tornozelo Esq'),
-            'tornozelo_direito':  ('#B4A7D6', Qt.DashDotLine, 'Tornozelo Dir'),
+            'ombro_esquerdo':      ('#FF6B35', Qt.SolidLine,      'Ombro Esq'),
+            'ombro_direito':       ('#4ECDC4', Qt.SolidLine,      'Ombro Dir'),
+            'cotovelo_esquerdo':   ('#f85149', Qt.SolidLine,      'Cotovelo Esq'),
+            'cotovelo_direito':    ('#3fb950', Qt.SolidLine,      'Cotovelo Dir'),
+            'punho_esquerdo':      ('#d29922', Qt.DashLine,       'Punho Esq'),
+            'punho_direito':       ('#e6edf3', Qt.DashLine,       'Punho Dir'),
+            'quadril_esquerdo':    ('#bc8cff', Qt.DotLine,        'Quadril Esq'),
+            'quadril_direito':     ('#A8E6CF', Qt.DotLine,        'Quadril Dir'),
+            'joelho_esquerdo':     ('#58a6ff', Qt.SolidLine,      'Joelho Esq'),
+            'joelho_direito':      ('#00d4aa', Qt.SolidLine,      'Joelho Dir'),
+            'tornozelo_esquerdo':  ('#FF8B94', Qt.DashDotLine,    'Tornozelo Esq'),
+            'tornozelo_direito':   ('#B4A7D6', Qt.DashDotLine,    'Tornozelo Dir'),
+            # Ombro 3D
+            'ombro_abd_esquerdo':  ('#FF8C00', Qt.DashLine,       'Abd Ombro Esq'),
+            'ombro_abd_direito':   ('#00CED1', Qt.DashLine,       'Abd Ombro Dir'),
+            'ombro_flex_esquerdo': ('#FFD700', Qt.DotLine,        'Flex Ombro Esq'),
+            'ombro_flex_direito':  ('#98FB98', Qt.DotLine,        'Flex Ombro Dir'),
+            'ombro_rot_esquerdo':  ('#DDA0DD', Qt.DashDotLine,    'Rot Ombro Esq'),
+            'ombro_rot_direito':   ('#F0E68C', Qt.DashDotLine,    'Rot Ombro Dir'),
         }
+        self.eixo_y_dados = {k: deque(maxlen=self.buffer_size) for k in _CORES_PLOT}
         self.curvas_plot = {
             k: self.grafico.plot(pen=pg.mkPen(c, width=2, style=s), name=n)
             for k, (c, s, n) in _CORES_PLOT.items()
