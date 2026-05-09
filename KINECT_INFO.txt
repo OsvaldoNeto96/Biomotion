@@ -1,0 +1,28 @@
+=====================================================
+  BioMotion v2.1 - Informacao sobre Hardware
+=====================================================
+
+SENSOR KINECT (captura 3D)
+---------------------------
+O BioMotion suporta o sensor Kinect para captura
+de profundidade e analise articular em 3D.
+
+Para usar o Kinect, instale o driver apos esta
+instalacao:
+
+  1. Ligue o Kinect via USB ao computador
+  2. Acesse: microsoft.com/download e pesquise
+     "Kinect for Windows SDK 2.0"
+  3. Instale o SDK (inclui o driver USB)
+  4. Abra o BioMotion - ele deteta o Kinect
+     automaticamente
+
+WEBCAM (modo alternativo)
+--------------------------
+Se nao tiver Kinect, o BioMotion funciona
+automaticamente com a webcam do computador.
+A analise articular e feita em 2D neste modo.
+
+=====================================================
+  Clique em "Proximo" para iniciar a instalacao.
+=====================================================

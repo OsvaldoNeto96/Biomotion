@@ -1,0 +1,28 @@
+# Ambiente virtual
+.venv/
+venv/
+
+# PyInstaller e builds
+build/
+dist/
+installer/
+
+# Ficheiros gerados em runtime
+Analises_Salvas/
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs e temporários
+*.log
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Sistema
+Thumbs.db
+.DS_Store
