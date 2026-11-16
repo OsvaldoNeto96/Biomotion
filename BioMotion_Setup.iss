@@ -1,10 +1,10 @@
 ; ============================================================
 ;  BioMotion - Script de Instalação (Inno Setup 6)
-;  Gera: installer\BioMotion_Setup_v2.1.exe
+;  Gera: installer\BioMotion_Instalador_v2.2.exe
 ; ============================================================
 
 #define AppName      "BioMotion"
-#define AppVersion   "2.1"
+#define AppVersion   "2.2"
 #define AppPublisher "BioMotion Clinico"
 #define AppExeName   "BioMotion.exe"
 #define AppSourceDir "dist\BioMotion"
@@ -31,6 +31,7 @@ LZMAUseSeparateProcess=yes
 
 WizardStyle=modern
 WizardSizePercent=120
+SetupIconFile=assets\icon.ico
 
 UninstallDisplayName={#AppName} v{#AppVersion}
 UninstallDisplayIcon={app}\{#AppExeName}

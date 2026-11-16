@@ -2,7 +2,7 @@
 :: ============================================================
 ::  BioMotion – Pipeline completo de build
 ::  Passo 1: PyInstaller → dist\BioMotion\
-::  Passo 2: Inno Setup  → installer\BioMotion_Instalador_v2.1.exe
+::  Passo 2: Inno Setup  → installer\BioMotion_Instalador_v2.2.exe
 :: ============================================================
 title BioMotion Build Pipeline
 setlocal
@@ -52,7 +52,7 @@ echo [2/2] Criando instalador com Inno Setup...
 if not exist %INNO% (
     echo.
     echo  [AVISO] Inno Setup nao encontrado em:
-    echo          C:\Program Files (x86)\Inno Setup 6\
+    echo          C:\Program Files ^(x86^)\Inno Setup 6\
     echo.
     echo  Para criar o instalador .exe:
     echo    1. Acesse: https://jrsoftware.org/isdl.php
@@ -81,7 +81,7 @@ echo   Executavel standalone:
 echo     dist\BioMotion\BioMotion.exe
 echo.
 echo   Instalador unico (distribuir este):
-echo     installer\BioMotion_Instalador_v2.1.exe
+echo     installer\BioMotion_Instalador_v2.2.exe
 echo  ================================================
 echo.
 pause

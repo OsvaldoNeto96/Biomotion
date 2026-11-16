@@ -27,6 +27,8 @@ hiddenimports = med_h + pg_h + oni_h + [
     'pyqtgraph.graphicsItems.ViewBox.axisCtrlTemplate_pyqt5',
     'pyqtgraph.graphicsItems.PlotItem.plotConfigTemplate_pyqt5',
     'pyqtgraph.imageview.ImageViewTemplate_pyqt5',
+    # Pillow (texto com acentos no overlay do vídeo)
+    'PIL', 'PIL.Image', 'PIL.ImageDraw', 'PIL.ImageFont',
     # Científico
     'scipy', 'scipy.spatial', 'scipy.linalg', 'scipy.special',
     'numpy', 'numpy.core', 'numpy.lib',
@@ -63,6 +65,8 @@ a = Analysis(
     excludes=[
         'tkinter', '_tkinter', 'IPython', 'jupyter',
         'notebook', 'pytest', 'xmlrunner',
+        # O app usa só PyQt5; outros bindings Qt no ambiente quebram o build/execução
+        'PySide6', 'shiboken6', 'PySide2', 'shiboken2', 'PyQt6',
     ],
     noarchive=False,
     optimize=1,
@@ -86,7 +90,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon='assets/icon.ico',  # Descomente e adicione um ícone .ico se desejar
+    icon='assets/icon.ico',
 )
 
 coll = COLLECT(
